@@ -1,0 +1,1082 @@
+---
+title: "Figure 4 script"
+output: html_notebook
+---
+
+#Load necessary packages
+```{r}
+library(svglite)
+library(tidyverse)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(msigdbr)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(ggVennDiagram)
+library(dplyr)
+library(tibble)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(ggh4x)
+library(GOSemSim)
+library(enrichplot)
+library(GO.db)
+library(ggrepel)
+```
+
+#Plot styling
+```{r}
+theme_set(
+  theme_classic(base_size = 11, base_family = "Helvetica") +
+    theme(
+      plot.title       = element_text(size = 13, face = "plain"),
+      plot.subtitle    = element_text(size = 10, color = "grey40"),
+      axis.title       = element_text(size = 11),
+      axis.text        = element_text(size = 10),
+      legend.title     = element_text(face = "bold", size = 10),
+      legend.text      = element_text(size = 9),
+      legend.key.size  = unit(0.55, "lines"),
+      legend.spacing.y = unit(0.15, "cm"),
+      legend.position  = "right"
+    )
+)
+plot_W <- 10
+plot_H <- 8
+```
+
+
+#Load the data
+```{r}
+rna <- read_tsv(
+  "~/HMS Dropbox/Daniela Coronado/Daniela's documents/Written docs/Daniela's manuscript/Manuscript version 5/Daniela final copy/Data files/Figure 4/RNASeq of BO glycolipis vs rmGal9/ZT4GNN-expression-matrix.tsv",
+  show_col_types = FALSE
+)
+
+rna_clean <- rna %>%
+  rename_with(~ str_replace_all(.x, " ", "")) %>%
+  rename_with(tolower)
+
+rna_long <- rna_clean %>%
+  pivot_longer(
+    cols         = matches("^zt4gnn_\\d+_(cpm|count)$"),
+    names_to     = c("sample", "measure"),
+    names_pattern = "^(zt4gnn_\\d+)_(cpm|count)$",
+    values_to    = "value"
+  ) %>%
+  group_by(gene_id, gene_name, gene_biotype, sample, measure) %>%
+  summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = measure, values_from = value)
+
+```
+
+#Organize the data
+```{r}
+sample_metadata <- tribble(
+  ~sample,      ~BOglycolipid,       ~gal9,      ~group,
+  "zt4gnn_1",   "absent",   "present",  "VHC_Gal9",
+  "zt4gnn_2",   "absent",   "present",  "VHC_Gal9",
+  "zt4gnn_3",   "absent",   "present",  "VHC_Gal9",
+  "zt4gnn_4",   "present",  "present",  "BOglycolipid_Gal9",
+  "zt4gnn_5",   "present",  "present",  "BOglycolipid_Gal9",
+  "zt4gnn_6",   "present",  "present",  "BOglycolipid_Gal9",
+  "zt4gnn_7",   "absent",   "absent",   "VHC_noGal9",
+  "zt4gnn_8",   "absent",   "absent",   "VHC_noGal9",
+  "zt4gnn_9",   "absent",   "absent",   "VHC_noGal9",
+  "zt4gnn_10",  "present",  "absent",   "BOglycolipid_noGal9",
+  "zt4gnn_11",  "present",  "absent",   "BOglycolipid_noGal9",
+  "zt4gnn_12",  "present",  "absent",   "BOglycolipid_noGal9"
+)
+
+# Remove outlier
+sample_metadata_no_outlier <- sample_metadata %>%
+  filter(sample != "zt4gnn_4")
+
+rna_long_no_outlier <- rna_long %>%
+  filter(sample != "zt4gnn_4") %>%
+  left_join(sample_metadata_no_outlier, by = "sample") %>%
+  mutate(
+    BOglycolipid   = factor(BOglycolipid,   levels = c("absent", "present")),
+    gal9  = factor(gal9,  levels = c("absent", "present")),
+    group = factor(group, levels = c("VHC_noGal9", "BOglycolipid_noGal9", "VHC_Gal9", "BOglycolipid_Gal9"))
+  )
+```
+
+#Make count matrix for DESeq
+```{r}
+count_mat <- rna_long_no_outlier %>%
+  dplyr::select(gene_id, sample, count) %>%
+  group_by(gene_id, sample) %>%
+  summarise(count = sum(count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = sample, values_from = count, values_fill = 0) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+storage.mode(count_mat) <- "integer"
+
+col_data <- sample_metadata_no_outlier %>%
+  mutate(
+    BOglycolipid   = factor(BOglycolipid,   levels = c("absent", "present")),
+    gal9  = factor(gal9,  levels = c("absent", "present")),
+    group = factor(group, levels = c("VHC_noGal9", "BOglycolipid_noGal9", "VHC_Gal9", "BOglycolipid_Gal9"))
+  ) %>%
+  column_to_rownames("sample")
+
+col_data <- col_data[colnames(count_mat), , drop = FALSE]
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat,
+  colData   = col_data,
+  design    = ~ group
+)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+dds <- DESeq(dds)
+
+gene_lookup <- rna_long_no_outlier %>%
+  distinct(gene_id, gene_name, gene_biotype) %>%
+  mutate(across(everything(), as.character))
+```
+
+
+#Calculate variance stabilized counts
+```{r}
+# VST for heat map
+vsd <- vst(dds, blind = TRUE)
+
+vsd_mat <- assay(vsd)
+
+id2sym   <- gene_lookup %>%
+  distinct(gene_id, gene_name) %>%
+  filter(!is.na(gene_name), gene_name != "")
+
+row_syms <- id2sym$gene_name[match(rownames(vsd_mat), id2sym$gene_id)]
+keep     <- !is.na(row_syms)
+vsd_sym  <- vsd_mat[keep, ]
+rownames(vsd_sym) <- row_syms[keep]
+vsd_sym  <- vsd_sym[order(rowMeans(vsd_sym), decreasing = TRUE), ]
+vsd_sym  <- vsd_sym[!duplicated(rownames(vsd_sym)), ]
+```
+
+
+#Build PCA plot
+```{r}
+pca_data    <- plotPCA(vsd, intgroup = "group", returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+pca_data_labeled <- pca_data %>%
+  left_join(
+    sample_metadata_no_outlier %>%
+      mutate(group_label = case_when(
+        group == "VHC_noGal9" ~ "Vehicle controls",
+        group == "BOglycolipid_noGal9" ~ "BO glycolipids alone",
+        group == "VHC_Gal9"   ~ "Gal-9 alone",
+        group == "BOglycolipid_Gal9"   ~ "BO glycolipids + Gal-9"
+      )) %>%
+      dplyr::select(sample, group_label),
+    by = c("name" = "sample")
+  )
+
+PCA_plot <- ggplot(
+  pca_data_labeled,
+  aes(x = PC1, y = PC2, color = group_label)
+) +
+  geom_point(size = 8, alpha = 0.9) +
+  labs(
+    title    = "PCA of RNA-seq samples",
+    subtitle = "Variance-stabilized counts; n = 2-3",
+    x        = paste0("PC1: ", percent_var[1], "% variance"),
+    y        = paste0("PC2: ", percent_var[2], "% variance"),
+    color    = "Group"
+  )
+
+ggsave(
+  filename = "RNAseq_PCA_no_sample4.svg",
+  plot     = PCA_plot,
+  width    = plot_W,
+  height   = plot_H,
+  device   = svglite::svglite
+)
+```
+#Precompute semantic similarity structure
+```{r}
+go_semdata_mm_bp <- godata(OrgDb = org.Mm.eg.db, ont = "BP")
+```
+
+
+
+#Extract top 20 GO pathways from BO glycolipid vs BO glycolipid+Gal-9
+```{r}
+#Extract top 20 GO pathways from BO glycolipid vs BO glycolipid+Gal-9
+# Map symbols to Entrez IDs (using all gene names from gene_lookup)
+symbol_to_entrez_full <- bitr(
+  gene_lookup$gene_name,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Mm.eg.db
+)
+
+# Helper: build preranked Entrez gene list from DESeq2 result
+build_entrez_ranklist <- function(res_df, stat_col, sym_col = "gene_name") {
+  res_df %>%
+    filter(
+      !is.na(.data[[stat_col]]),
+      !is.na(.data[[sym_col]]),
+      .data[[sym_col]] != ""
+    ) %>%
+    inner_join(symbol_to_entrez_full,
+               by = setNames("SYMBOL", sym_col)) %>%
+    group_by(ENTREZID) %>%
+    slice_max(abs(.data[[stat_col]]), n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    arrange(desc(.data[[stat_col]])) %>%
+    { setNames(.[[stat_col]], .$ENTREZID) }
+}
+
+# DESeq2 results: BOglycolipid+Gal-9 vs BOglycolipid_noGal9
+res_BOglycolipid_gal9_vs_BOglycolipid_nogal9 <- results(
+  dds,
+  contrast = c("group", "BOglycolipid_Gal9", "BOglycolipid_noGal9")
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_lookup, by = "gene_id") %>%
+  dplyr::rename(stat_BOglycolipidGal9_vs_BOglycolipid = stat)
+
+# Preranked list by Wald statistic
+gene_list_BOglycolipidGal9_vs_BOglycolipid_entrez <- build_entrez_ranklist(
+  res_BOglycolipid_gal9_vs_BOglycolipid_nogal9,
+  "stat_BOglycolipidGal9_vs_BOglycolipid"
+)
+
+set.seed(42)
+gsea_BOglycolipidGal9_vs_BOglycolipid_go <- gseGO(
+  geneList      = gene_list_BOglycolipidGal9_vs_BOglycolipid_entrez,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "BP",
+  keyType       = "ENTREZID",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  minGSSize     = 10,
+  maxGSSize     = 500,
+  eps           = 0,
+  verbose       = FALSE
+)
+
+# Reduce redundancy
+gsea_BOglycolipidGal9_vs_BOglycolipid_simplified <- simplify(
+  gsea_BOglycolipidGal9_vs_BOglycolipid_go,
+  cutoff     = 0.7,
+  by         = "p.adjust",
+  select_fun = min,
+  semData    = go_semdata_mm_bp
+)
+
+# Plain data frame for downstream use
+res_tbl_BOglycolipidGal9_vs_BOglycolipid <- as.data.frame(gsea_BOglycolipidGal9_vs_BOglycolipid_simplified@result)
+
+# write full table
+pathway_BOglycolipid_vs_BOglycolipidGal9 <- res_tbl_BOglycolipidGal9_vs_BOglycolipid %>%
+  dplyr::arrange(p.adjust)
+write.csv(
+  pathway_BOglycolipid_vs_BOglycolipidGal9,
+  file      = "Pathway_GSEA_BOglycolipidGal9_vs_BOglycolipidnoGal9.csv",
+  row.names = FALSE
+)
+```
+
+##Dot plot of top 10 positively and negatively GO pathways in BO glycolipids +/- Gal-9
+```{r}
+
+res_tbl_BOglycolipidGal9_vs_BOglycolipid <- as.data.frame(gsea_BOglycolipidGal9_vs_BOglycolipid_simplified@result)
+
+gsea_df <- res_tbl_BOglycolipidGal9_vs_BOglycolipid %>%
+  dplyr::select(dplyr::any_of(
+    c("ID", "Description", "NES", "pvalue", "p.adjust", "setSize", "core_enrichment")
+  )) %>%
+  {
+    if (!"setSize" %in% colnames(.)) {
+      if ("core_enrichment" %in% colnames(.)) {
+        . <- mutate(.,
+          setSize = stringr::str_count(core_enrichment, "/") + 1
+        )
+      } else {
+        . <- mutate(., setSize = NA_real_)
+      }
+    }
+    .
+  } %>%
+  mutate(
+    padj_plot = dplyr::case_when(
+      "p.adjust" %in% colnames(.) ~ p.adjust,
+      TRUE                        ~ pvalue
+    )
+  ) %>%
+  filter(!is.na(NES), !is.na(padj_plot))
+
+top_up <- gsea_df %>%
+  filter(NES > 0) %>%
+  arrange(padj_plot) %>%
+  slice_head(n = 10)
+
+top_down <- gsea_df %>%
+  filter(NES < 0) %>%
+  arrange(padj_plot) %>%
+  slice_head(n = 10)
+
+dot_df <- bind_rows(top_up, top_down) %>%
+  mutate(neg_log10_padj = -log10(padj_plot)) %>%
+  arrange(desc(NES)) %>%
+  mutate(Description = factor(Description, levels = unique(Description)))
+
+dot_plot_bidir <- ggplot(
+  dot_df,
+  aes(x = NES, y = Description, size = setSize, color = neg_log10_padj)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey80") +
+  geom_point(alpha = 0.9) +
+  scale_color_gradient(low = "#BDD7E7", high = "#08519C",
+                        name = expression(-log[10]("adjusted p-value"))) +
+  scale_size_continuous(name = "Gene set size", range = c(2, 8)) +
+  labs(
+    x        = "Normalized Enrichment Score (NES)",
+    y        = NULL,
+    title    = "Top 10 positively and negatively enriched GO:BP pathways",
+    subtitle = "BOglycolipid+Gal-9 vs BOglycolipid (GSEA, DESeq2 Wald statistic)\nNegative NES pathways appear at top"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.y  = element_text(size = 9),
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8)
+  )
+dot_plot_bidir <- dot_plot_bidir +
+  ggh4x::force_panelsizes(cols = unit(2, "in"))
+dot_plot_bidir
+
+ggsave(
+  filename = "Dotplot_top10_up_down_GO_BOglycolipidGal9_vs_BOglycolipid_NESx_pvalColor_negOnTop.svg",
+  plot     = dot_plot_bidir,
+  width    = 8,
+  height   = 6,
+  device   = svglite::svglite
+)
+```
+
+#Compare VHC with BO glycolipid treatment
+```{r}
+#Compare VHC with BO glycolipid treatment
+res_BOglycolipid_vs_vhc_nogal9 <- results(
+  dds,
+  contrast = c("group", "BOglycolipid_noGal9", "VHC_noGal9")
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_lookup, by = "gene_id") %>%
+  dplyr::rename(stat_BOglycolipid_vs_VHC_noGal9 = stat)
+
+gene_list_BOglycolipid_vs_VHC_noGal9_entrez <- build_entrez_ranklist(
+  res_BOglycolipid_vs_vhc_nogal9,
+  "stat_BOglycolipid_vs_VHC_noGal9"
+)
+
+set.seed(42)
+gsea_BOglycolipid_vs_VHC_noGal9_go <- gseGO(
+  geneList      = gene_list_BOglycolipid_vs_VHC_noGal9_entrez,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "BP",
+  keyType       = "ENTREZID",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  minGSSize     = 10,
+  maxGSSize     = 500,
+  eps           = 0,
+  verbose       = FALSE
+)
+
+# Reduce redundancy
+gsea_BOglycolipid_vs_VHC_noGal9_simplified <- simplify(
+  gsea_BOglycolipid_vs_VHC_noGal9_go,
+  cutoff     = 0.7,
+  by         = "p.adjust",
+  select_fun = min,
+  semData    = go_semdata_mm_bp
+)
+
+res_tbl_BOglycolipid_vs_VHC_noGal9 <- as.data.frame(gsea_BOglycolipid_vs_VHC_noGal9_simplified@result)
+
+pathway_VHC_vs_BOglycolipid_noGal9 <- res_tbl_BOglycolipid_vs_VHC_noGal9 %>%
+  dplyr::arrange(p.adjust)
+write.csv(
+  pathway_VHC_vs_BOglycolipid_noGal9,
+  file      = "Pathway_GSEA_BOglycolipidnoGal9_vs_VHCnoGal9.csv",
+  row.names = FALSE
+)
+```
+
+#Dot plot for VHC vs BO glycolipid (no gal-9)
+```{r}
+
+res_tbl_BOglycolipid_vs_VHC_noGal9 <- as.data.frame(gsea_BOglycolipid_vs_VHC_noGal9_simplified@result)
+
+gsea_df_noGal9 <- res_tbl_BOglycolipid_vs_VHC_noGal9 %>%
+  dplyr::select(dplyr::any_of(
+    c("ID", "Description", "NES", "pvalue", "p.adjust", "setSize", "core_enrichment")
+  )) %>%
+  {
+    if (!"setSize" %in% colnames(.)) {
+      if ("core_enrichment" %in% colnames(.)) {
+        . <- mutate(.,
+          setSize = stringr::str_count(core_enrichment, "/") + 1
+        )
+      } else {
+        . <- mutate(., setSize = NA_real_)
+      }
+    }
+    .
+  } %>%
+  mutate(
+    padj_plot = dplyr::case_when(
+      "p.adjust" %in% colnames(.) ~ p.adjust,
+      TRUE                        ~ pvalue
+    )
+  ) %>%
+  filter(!is.na(NES), !is.na(padj_plot))
+
+top_up_noGal9 <- gsea_df_noGal9 %>%
+  filter(NES > 0) %>%
+  arrange(padj_plot) %>%
+  slice_head(n = 10)
+
+top_down_noGal9 <- gsea_df_noGal9 %>%
+  filter(NES < 0) %>%
+  arrange(padj_plot) %>%
+  slice_head(n = 10)
+
+# arrange(NES) ascending -> most positive NES becomes the LAST factor level ->
+# last level plots at the TOP of a discrete y-axis in ggplot.
+dot_df_noGal9 <- bind_rows(top_up_noGal9, top_down_noGal9) %>%
+  mutate(neg_log10_padj = -log10(padj_plot)) %>%
+  arrange(NES) %>%
+  mutate(
+    Description = stringr::str_wrap(Description, width = 45),
+    Description = factor(Description, levels = unique(Description))
+  )
+
+dot_plot_bidir_noGal9 <- ggplot(
+  dot_df_noGal9,
+  aes(x = NES, y = Description, size = setSize, color = neg_log10_padj)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey80") +
+  geom_point(alpha = 0.9) +
+  scale_color_gradient(low = "#BDD7E7", high = "#08519C",
+                        name = expression(-log[10]("adjusted p-value"))) +
+  scale_size_continuous(name = "Gene set size", range = c(2, 8)) +
+  labs(
+    x        = "Normalized Enrichment Score (NES)",
+    y        = NULL,
+    title    = "Top 10 positively and negatively enriched GO:BP pathways",
+    subtitle = "BOglycolipid (no Gal-9) vs VHC (no Gal-9) (GSEA, DESeq2 Wald statistic)\nPositive NES pathways appear at top"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.y  = element_text(size = 9),
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8),
+    plot.margin  = margin(t = 10, r = 10, b = 10, l = 10),
+    plot.title.position = "plot"
+  ) +
+  coord_cartesian(clip = "off")
+
+dot_plot_bidir_noGal9 <- dot_plot_bidir_noGal9 +
+  ggh4x::force_panelsizes(cols = unit(2, "in"))
+dot_plot_bidir_noGal9
+
+ggsave(
+  filename = "Dotplot_top10_up_down_GO_BOglycolipidnoGal9_vs_VHCnoGal9_NESx_pvalColor_posOnTop.svg",
+  plot     = dot_plot_bidir_noGal9,
+  width    = 8,
+  height   = 6,   
+  device   = svglite::svglite
+)
+```
+
+
+#Build heat map
+```{r}
+# Pull GO:0019882 (Antigen processing and presentation) leading edge genes from the BOglycolipid+Gal-9 vs BOglycolipid (no Gal-9) GSEA 
+#Extract leading edge genes from GO:0019882
+
+ap_go_entrez_h <- as.data.frame(gsea_BOglycolipidGal9_vs_BOglycolipid_simplified@result) %>%
+  filter(ID == "GO:0019882") %>%
+  pull(core_enrichment) %>%
+  str_split("/") %>%
+  unlist()
+
+ap_go_symbols_h <- bitr(
+  ap_go_entrez_h,
+  fromType = "ENTREZID",
+  toType   = "SYMBOL",
+  OrgDb    = org.Mm.eg.db
+)
+
+#Filter for genes significant in the BOglycolipid+Gal-9 vs BOglycolipid contrast
+sig_BOglycolipidgal9_vs_BOglycolipid <- res_BOglycolipid_gal9_vs_BOglycolipid_nogal9 %>%
+  filter(!is.na(padj), padj < 0.05)
+
+ap_go_sig_h <- ap_go_symbols_h %>%
+  filter(SYMBOL %in% sig_BOglycolipidgal9_vs_BOglycolipid$gene_name) %>%
+  left_join(
+    sig_BOglycolipidgal9_vs_BOglycolipid %>%
+      dplyr::select(gene_name, log2FoldChange, padj),
+    by = c("SYMBOL" = "gene_name")
+  ) %>%
+  dplyr::rename(log2FC_group = log2FoldChange)
+
+cat("Leading-edge genes passing padj < 0.05 in BOglycolipid+Gal-9 vs BOglycolipid:", nrow(ap_go_sig_h), "\n")
+
+#Restrict to the top 20 leading-edge genes by |log2FC|
+ap_go_sig_h_top20 <- ap_go_sig_h %>%
+  filter(!is.na(log2FC_group)) %>%
+  slice_max(order_by = abs(log2FC_group), n = 20, with_ties = FALSE)
+
+cat("Top leading-edge genes retained for heatmap:", nrow(ap_go_sig_h_top20), "\n")
+
+#Build z-score matrix
+genes_present_go_h <- intersect(ap_go_sig_h_top20$SYMBOL, rownames(vsd_sym))
+
+vsd_subset_go_h <- vsd_sym[genes_present_go_h, ]
+
+zscore_mat_go_h <- t(scale(t(vsd_subset_go_h)))
+
+# Group-averaged z-scores
+group_order_go_h <- c("VHC_noGal9", "VHC_Gal9", "BOglycolipid_noGal9", "BOglycolipid_Gal9")
+ 
+group_labels_go_h <- c(
+  "VHC_noGal9" = "VHC",
+  "VHC_Gal9"   = "VHC + Gal-9",
+  "BOglycolipid_noGal9" = "BO glycolipid",
+  "BOglycolipid_Gal9"   = "BO glycolipid + Gal-9"
+)
+ 
+zscore_group_go_h <- sapply(group_order_go_h, function(grp) {
+  cols <- rownames(col_data)[col_data$group == grp]
+  cols <- intersect(cols, colnames(zscore_mat_go_h))
+  if (length(cols) == 1) return(zscore_mat_go_h[, cols, drop = TRUE])
+  rowMeans(zscore_mat_go_h[, cols, drop = FALSE])
+})
+ 
+colnames(zscore_group_go_h) <- group_labels_go_h[group_order_go_h]
+ 
+# Gene ordering by log2FC 
+gene_order_df_go_h <- ap_go_sig_h_top20 %>%
+  filter(SYMBOL %in% genes_present_go_h) %>%
+  arrange(desc(log2FC_group))
+
+# Reorder rows (genes) to match gene_order_df_go_h 
+zscore_group_go_h_v <- zscore_group_go_h[gene_order_df_go_h$SYMBOL, ]
+ 
+# olor scale 
+score_lim_go_h <- quantile(abs(zscore_group_go_h_v), 0.95, na.rm = TRUE)
+ 
+col_fun_go_h <- colorRamp2(
+  c(-score_lim_go_h, 0, score_lim_go_h),
+  c("#2166AC", "white", "#C0392B")
+)
+ 
+# Vertical heatmap
+n_genes_h  <- nrow(zscore_group_go_h_v)
+n_groups_h <- ncol(zscore_group_go_h_v)
+
+ht_go_h <- Heatmap(
+  zscore_group_go_h_v,
+  name             = "Z-score",
+  col              = col_fun_go_h,
+  
+  # Rows (genes)
+  cluster_rows     = FALSE,
+  row_order        = gene_order_df_go_h$SYMBOL,
+  row_names_gp     = gpar(fontsize = 12),
+  row_names_side   = "left",
+  
+  # Columns (treatment groups)
+  cluster_columns  = FALSE,
+  column_order     = c(
+    "VHC",
+    "VHC + Gal-9",
+    "BO glycolipid",
+    "BO glycolipid + Gal-9"
+  ),
+  column_names_gp  = gpar(fontsize = 12),
+  column_names_rot = 45,
+  column_names_max_height = unit(4, "cm"),
+  
+  # Borders and sizing -- equal cm per row and per column 
+  rect_gp          = gpar(col = "white", lwd = 0.5),
+  height           = unit(n_genes_h, "cm"),
+  width            = unit(n_groups_h, "cm"),
+  
+  row_title        = "GO:0019882 Antigen processing and presentation\n(top 20 leading-edge genes by |log2FC|, padj < 0.05, BOglycolipid+Gal-9 vs BOglycolipid)",
+  row_title_gp     = gpar(fontsize = 12)
+)
+ 
+# Export
+svglite::svglite(
+  filename = "AP_heatmap_GO0019882_BOglycolipidGal9_vs_BOglycolipid_top20_vertical.svg",
+  width    = 12,                 # cm -- columns + row labels + legend
+  height   = n_genes_h + 6        # cm -- rows + row title + rotated column labels
+)
+draw(
+  ht_go_h,
+  heatmap_legend_side = "right",
+  padding = unit(c(5, 20, 5, 5), "mm")
+)
+dev.off()
+```
+
+
+#Enrichment plot
+```{r}
+
+# Confirm the term is present in the GSEA result
+ap_row_check <- as.data.frame(gsea_BOglycolipidGal9_vs_BOglycolipid_simplified@result) %>%
+  filter(ID == "GO:0019882")
+
+if (nrow(ap_row_check) == 0) {
+  stop(
+    "GO:0019882 is not present in gsea_BOglycolipidGal9_vs_BOglycolipid_simplified -- it may ",
+    "have been collapsed by simplify(). Re-run gseaplot2() on the ",
+    "non-simplified object (gsea_BOglycolipidGal9_vs_BOglycolipid_go) instead."
+  )
+}
+
+# Running enrichment score plot
+ap_gsea_plot <- gseaplot2(
+  gsea_BOglycolipidGal9_vs_BOglycolipid_simplified,
+  geneSetID   = "GO:0019882",
+  title       = paste0(
+    "GO:0019882 Antigen processing and presentation\n",
+    "BOglycolipid+Gal-9 vs BOglycolipid (NES = ", round(ap_row_check$NES, 2),
+    ", padj = ", formatC(ap_row_check$p.adjust, format = "e", digits = 2), ")"
+  ),
+  color       = "#08519C",
+  base_size   = 11,
+  rel_heights = c(1.5, 0.5, 1),
+  subplots    = 1:3,
+  pvalue_table = FALSE
+)
+
+ap_gsea_plot
+
+#Export
+ggsave(
+  filename = "GSEA_runningscore_GO0019882_BOglycolipidGal9_vs_BOglycolipid.svg",
+  plot     = ap_gsea_plot,
+  width    = 8,
+  height   = 6,
+  device   = svglite::svglite
+)
+```
+#Scatter plot
+```{r}
+
+res_BOglycolipid_noGal9 <- res_BOglycolipid_vs_vhc_nogal9 %>%
+  dplyr::rename(
+    log2FC_BOglycolipid_noGal9 = log2FoldChange,
+    pvalue_BOglycolipid_noGal9 = pvalue,
+    padj_BOglycolipid_noGal9   = padj
+  ) %>%
+  dplyr::select(
+    gene_id, gene_name,
+    log2FC_BOglycolipid_noGal9, pvalue_BOglycolipid_noGal9, padj_BOglycolipid_noGal9
+  )
+ 
+# BOglycolipid_Gal9 vs VHC_Gal9
+res_BOglycolipid_Gal9 <- results(
+  dds,
+  contrast = c("group", "BOglycolipid_Gal9", "VHC_Gal9")
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  left_join(gene_lookup, by = "gene_id") %>%
+  dplyr::rename(
+    log2FC_BOglycolipid_Gal9 = log2FoldChange,
+    pvalue_BOglycolipid_Gal9 = pvalue,
+    padj_BOglycolipid_Gal9   = padj
+  ) %>%
+  dplyr::select(
+    gene_id,
+    log2FC_BOglycolipid_Gal9, pvalue_BOglycolipid_Gal9, padj_BOglycolipid_Gal9
+  )
+ 
+#Merge contrasts into one scatter-ready table
+de_scatter <- res_BOglycolipid_noGal9 %>%
+  left_join(res_BOglycolipid_Gal9, by = "gene_id")
+ 
+# Filter to genes significant (padj < 0.05, |log2FC| > 1.5) in at least one of the two contrasts 
+de_scatter_sig <- de_scatter %>%
+  filter(
+    (padj_BOglycolipid_noGal9 < 0.05 & abs(log2FC_BOglycolipid_noGal9) > 1.5) |
+      (padj_BOglycolipid_Gal9 < 0.05 & abs(log2FC_BOglycolipid_Gal9) > 1.5)
+  )
+ 
+# Classify directionality of the BOglycolipid effect with vs without Gal-9 
+de_scatter_sig <- de_scatter_sig %>%
+  mutate(
+    plot_color = case_when(
+ 
+      # ── Top-right: both > 1.5, split by diagonal ──────────────────────────
+      log2FC_BOglycolipid_noGal9 > 1.5 & log2FC_BOglycolipid_Gal9 > 1.5 & log2FC_BOglycolipid_Gal9 > log2FC_BOglycolipid_noGal9 ~
+        "Stronger with Gal-9",
+      log2FC_BOglycolipid_noGal9 > 1.5 & log2FC_BOglycolipid_Gal9 > 1.5 & log2FC_BOglycolipid_Gal9 < log2FC_BOglycolipid_noGal9 ~
+        "Stronger without Gal-9",
+      log2FC_BOglycolipid_noGal9 > 1.5 & log2FC_BOglycolipid_Gal9 > 1.5 ~
+        "Equal (up)",
+ 
+      # ── Top-right extensions ───────────────────────────────────────────────
+      log2FC_BOglycolipid_noGal9 > 0 & log2FC_BOglycolipid_noGal9 < 1.5 & log2FC_BOglycolipid_Gal9 > 1.5 ~
+        "Stronger with Gal-9",
+      log2FC_BOglycolipid_noGal9 > 1.5 & log2FC_BOglycolipid_Gal9 > 0 & log2FC_BOglycolipid_Gal9 < 1.5 ~
+        "Stronger without Gal-9",
+ 
+      # ── Bottom-left: both < -1.5, split by diagonal ───────────────────────
+      log2FC_BOglycolipid_noGal9 < -1.5 & log2FC_BOglycolipid_Gal9 < -1.5 & log2FC_BOglycolipid_Gal9 < log2FC_BOglycolipid_noGal9 ~
+        "Suppression stronger with Gal-9",
+      log2FC_BOglycolipid_noGal9 < -1.5 & log2FC_BOglycolipid_Gal9 < -1.5 & log2FC_BOglycolipid_Gal9 > log2FC_BOglycolipid_noGal9 ~
+        "Suppression stronger without Gal-9",
+      log2FC_BOglycolipid_noGal9 < -1.5 & log2FC_BOglycolipid_Gal9 < -1.5 ~
+        "Equal (down)",
+ 
+      # ── Bottom-left extensions ─────────────────────────────────────────────
+      log2FC_BOglycolipid_noGal9 < 0 & log2FC_BOglycolipid_noGal9 > -1.5 & log2FC_BOglycolipid_Gal9 < -1.5 ~
+        "Suppression stronger with Gal-9",
+      log2FC_BOglycolipid_noGal9 < -1.5 & log2FC_BOglycolipid_Gal9 < 0 & log2FC_BOglycolipid_Gal9 > -1.5 ~
+        "Suppression stronger without Gal-9",
+ 
+      TRUE ~ "Other"
+    )
+  )
+ 
+# Plot styling inputs
+plot_colors <- c(
+  "Stronger with Gal-9"                = "#2166AC",
+  "Stronger without Gal-9"             = "#C0392B",
+  "Equal (up)"                         = "grey60",
+  "Suppression stronger with Gal-9"    = "#6A0DAD",
+  "Suppression stronger without Gal-9" = "#1B7A4A",
+  "Equal (down)"                       = "grey60",
+  "Other"                              = "grey85"
+)
+ 
+# Panel size for force_panelsizes() 
+panel_size <- unit(4, "in")
+ 
+# Shading polygons 
+ax_max <- ceiling(max(
+  abs(de_scatter_sig$log2FC_BOglycolipid_noGal9),
+  abs(de_scatter_sig$log2FC_BOglycolipid_Gal9),
+  na.rm = TRUE
+))
+ 
+# Blue: rectangle (0 < x < 1.5, y > 1.5) + triangle (x > 1.5, y > x)
+tr_blue <- data.frame(
+  x = c(0,      1.5,    ax_max, 0     ),
+  y = c(1.5,    1.5,    ax_max, ax_max)
+)
+ 
+# Red: triangle (y > 1.5, x > y) + rectangle (x > 1.5, 0 < y < 1.5)
+tr_red <- data.frame(
+  x = c(1.5,    ax_max, ax_max, 1.5),
+  y = c(0,      0,      ax_max, 1.5)
+)
+ 
+# Purple: rectangle (-1.5 < x < 0, y < -1.5) + triangle (x < -1.5, y < x)
+bl_purple <- data.frame(
+  x = c(0,      -1.5,    -ax_max, 0      ),
+  y = c(-1.5,   -1.5,    -ax_max, -ax_max)
+)
+ 
+# Green: triangle (y < -1.5, x < y) + rectangle (x < -1.5, -1.5 < y < 0)
+bl_green <- data.frame(
+  x = c(-1.5,   -ax_max, -ax_max, -1.5),
+  y = c(0,       0,      -ax_max, -1.5)
+)
+ 
+# Plot 
+scatter_plot_1 <- ggplot(de_scatter_sig, aes(x = log2FC_BOglycolipid_noGal9, y = log2FC_BOglycolipid_Gal9)) +
+ 
+  # Shaded regions
+  geom_polygon(data = tr_blue,   aes(x = x, y = y),
+               fill = "#2166AC", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = tr_red,    aes(x = x, y = y),
+               fill = "#C0392B", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = bl_purple, aes(x = x, y = y),
+               fill = "#6A0DAD", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = bl_green,  aes(x = x, y = y),
+               fill = "#1B7A4A", alpha = 0.06, inherit.aes = FALSE) +
+ 
+  # Gray points first (bottom layer)
+  geom_point(
+    data  = ~filter(.x, plot_color == "Other"),
+    color = "grey85",
+    size  = 1.8, alpha = 0.6
+  ) +
+  # Colored points on top
+  geom_point(
+    data = ~filter(.x, plot_color != "Other"),
+    aes(color = plot_color),
+    size = 1.8, alpha = 0.75
+  ) +
+ 
+  # Reference lines
+  geom_hline(yintercept = 0,    linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = 0,    linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_hline(yintercept =  1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_hline(yintercept = -1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_vline(xintercept =  1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_vline(xintercept = -1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", linewidth = 0.7, color = "grey30") +
+ 
+  scale_color_manual(
+    values = plot_colors,
+    labels = c(
+      "Stronger with Gal-9"                = "Upregulation stronger with Gal-9",
+      "Stronger without Gal-9"             = "Upregulation stronger without Gal-9",
+      "Equal (up)"                         = "Upregulation equal with/without Gal-9",
+      "Suppression stronger with Gal-9"    = "Suppression stronger with Gal-9",
+      "Suppression stronger without Gal-9" = "Suppression stronger without Gal-9",
+      "Equal (down)"                       = "Suppression equal with/without Gal-9"
+    ),
+    na.translate = FALSE
+  ) +
+  coord_fixed(xlim = c(-ax_max, ax_max), ylim = c(-ax_max, ax_max)) +
+  guides(
+    color = guide_legend(override.aes = list(size = 4, alpha = 1), ncol = 1)
+  ) +
+  labs(
+    title    = "DC response to BO glycolipid with and without exogenous Gal-9",
+    subtitle = "Genes shown: adjusted p-value < 0.05 and absolute log2 fold-change (FC) > 1.5 in at least one contrast",
+    x        = "BO glycolipid effect without Gal-9 (log2FC)",
+    y        = "BO glycolipid effect with Gal-9 (log2FC)",
+    color    = "Response class"
+  ) +
+  theme(
+    legend.box.margin = margin(0, 0, 0, 6)
+  ) +
+  ggh4x::force_panelsizes(rows = panel_size, cols = panel_size)
+ 
+scatter_plot_1
+ 
+ggsave(
+  filename = "BOglycolipid_response_scatter_diagonal_shading_no_sample4.svg",
+  plot     = scatter_plot_1,
+  width    = plot_W,
+  height   = plot_H,
+  device   = svglite::svglite
+)
+```
+
+#Overlay genes into scatterplot
+
+```{r}
+
+#Pull every descendant GO:BP term of GO:0019882 
+ap_offspring <- as.list(GOBPOFFSPRING["GO:0019882"])[["GO:0019882"]]
+ap_all_ids   <- c(ap_offspring)
+
+ap_terms <- AnnotationDbi::select(
+  GO.db,
+  keys    = ap_all_ids,
+  keytype = "GOID",
+  columns = "TERM"
+)
+
+# Test child terms directly using the NON-simplified GSEA object. gsea_BOglycolipidGal9_vs_BOglycolipid_go (pre-simplify()), not gsea_BOglycolipidGal9_vs_BOglycolipid_simplified. 
+ap_child_gsea <- as.data.frame(gsea_BOglycolipidGal9_vs_BOglycolipid_go@result) %>%
+  filter(ID %in% ap_all_ids) %>%
+  left_join(ap_terms, by = c("ID" = "GOID"))
+
+# Recompute FDR WITHIN just this subtree, not genome-wide. 
+ap_child_gsea <- ap_child_gsea %>%
+  mutate(p.adjust_subtree = p.adjust(pvalue, method = "BH")) %>%
+  arrange(p.adjust_subtree)
+
+# Report 
+cat("Child terms of GO:0019882 actually tested by gseGO():", nrow(ap_child_gsea), "\n")
+cat("Child terms significant WITHIN the subtree (p.adjust_subtree < 0.05):",
+    sum(ap_child_gsea$p.adjust_subtree < 0.05), "\n\n")
+
+ap_child_gsea_report <- ap_child_gsea %>%
+  dplyr::select(ID, TERM, NES, setSize, pvalue, p.adjust_subtree)
+
+print(ap_child_gsea_report)
+```
+
+
+#MHCII and MHCI pathways enriched within the parent pathway 
+#Highlight top 5 leading edge genes for each
+```{r}
+# Define the GO IDs backing each category, based on the subtree. GSEA results table (child terms tested directly, non-simplified object, subtree FDR-corrected) 
+mhc2_ids <- c(
+  "GO:0002495",  # antigen processing and presentation of peptide antigen via MHC class II
+  "GO:0019886",  # ...of exogenous peptide antigen via MHC class II
+  "GO:0002504",  # ...of peptide or polysaccharide antigen via MHC class II
+  "GO:0002503"   # peptide antigen assembly with MHC class II protein complex
+)
+
+mhc1_ids <- c(
+  "GO:0042590",  # antigen processing and presentation of exogenous peptide antigen via MHC class I (cross-presentation)
+  "GO:0002474"   # antigen processing and presentation of peptide antigen via MHC class I
+)
+
+# Pull leading-edge genes for each 
+extract_leading_edge <- function(gsea_obj, go_ids) {
+  as.data.frame(gsea_obj@result) %>%
+    filter(ID %in% go_ids) %>%
+    pull(core_enrichment) %>%
+    str_split("/") %>%
+    unlist() %>%
+    unique()
+}
+
+mhc2_entrez <- extract_leading_edge(gsea_BOglycolipidGal9_vs_BOglycolipid_go, mhc2_ids)
+mhc1_entrez <- extract_leading_edge(gsea_BOglycolipidGal9_vs_BOglycolipid_go, mhc1_ids)
+
+cat("Unique leading-edge genes -- MHC class II terms:", length(mhc2_entrez), "\n")
+cat("Unique leading-edge genes -- MHC class I terms:", length(mhc1_entrez), "\n")
+
+# Convert to gene symbols
+mhc2_symbols <- bitr(mhc2_entrez, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+mhc1_symbols <- bitr(mhc1_entrez, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+
+# Rank by EFFECT SIZE, restricted to genes that are significant. First filter to padj < 0.05 (must be significant), THEN rank by |log2FoldChange| 
+mhc2_top5 <- res_BOglycolipid_gal9_vs_BOglycolipid_nogal9 %>%
+  filter(gene_name %in% mhc2_symbols$SYMBOL, !is.na(padj), padj < 0.05) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 5, with_ties = FALSE) %>%
+  mutate(mhc_category = "MHC class II")
+
+mhc1_top5 <- res_BOglycolipid_gal9_vs_BOglycolipid_nogal9 %>%
+  filter(gene_name %in% mhc1_symbols$SYMBOL, !is.na(padj), padj < 0.05) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 5, with_ties = FALSE) %>%
+  mutate(mhc_category = "MHC class I")
+
+# Combined highlight table 
+mhc_top5_highlight <- bind_rows(mhc1_top5, mhc2_top5) %>%
+  dplyr::select(gene_name, mhc_category, log2FoldChange, padj, stat_BOglycolipidGal9_vs_BOglycolipid)
+
+cat("\nTop 5 MHC class I genes (BOglycolipid+Gal-9 vs BOglycolipid):\n")
+print(mhc1_top5 %>% dplyr::select(gene_name, log2FoldChange, padj))
+
+cat("\nTop 5 MHC class II genes (BOglycolipid+Gal-9 vs BOglycolipid):\n")
+print(mhc2_top5 %>% dplyr::select(gene_name, log2FoldChange, padj))
+
+```
+
+#Build scatter plot highlighting what's above
+```{r}
+
+# Join the highlight genes onto the scatter coordinates 
+mhc_highlight_coords <- mhc_top5_highlight %>%
+  dplyr::select(gene_name, mhc_category) %>%
+  inner_join(
+    de_scatter_sig %>%
+      dplyr::select(gene_name, log2FC_BOglycolipid_noGal9, log2FC_BOglycolipid_Gal9),
+    by = "gene_name"
+  )
+
+cat("MHC highlight genes with plottable coordinates:", nrow(mhc_highlight_coords), "\n")
+print(mhc_highlight_coords)
+
+n_expected <- nrow(mhc_top5_highlight)
+n_matched  <- nrow(mhc_highlight_coords)
+if (n_matched < n_expected) {
+  cat(
+    "\nNOTE:", n_expected - n_matched,
+    "highlight gene(s) were not found in de_scatter_sig and will not appear",
+    "on the plot -- check mhc_top5_highlight vs de_scatter_sig$gene_name.\n"
+  )
+}
+
+# Colors for the two highlighted categories
+mhc_highlight_colors <- c(
+  "MHC class I"  = "#1F78B4",
+  "MHC class II" = "#33A02C"
+)
+
+# Scatter plot 
+scatter_plot_3 <- ggplot(de_scatter_sig, aes(x = log2FC_BOglycolipid_noGal9, y = log2FC_BOglycolipid_Gal9)) +
+
+# Quadrant shading (reused from scatter_plot_1)
+  geom_polygon(data = tr_blue,   aes(x = x, y = y),
+               fill = "#2166AC", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = tr_red,    aes(x = x, y = y),
+               fill = "#C0392B", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = bl_purple, aes(x = x, y = y),
+               fill = "#6A0DAD", alpha = 0.06, inherit.aes = FALSE) +
+  geom_polygon(data = bl_green,  aes(x = x, y = y),
+               fill = "#1B7A4A", alpha = 0.06, inherit.aes = FALSE) +
+ 
+  # Reference lines
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_hline(yintercept =  1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_hline(yintercept = -1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_vline(xintercept =  1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_vline(xintercept = -1.5, linetype = "dashed", linewidth = 0.3, color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", linewidth = 0.7, color = "grey30") +
+ 
+  # All significant genes as light grey background
+  geom_point(color = "grey85", size = 1.6, alpha = 0.5) +
+ 
+  # Highlighted MHC-I / MHC-II genes on top
+   geom_point(
+    data = mhc_highlight_coords,
+    aes(x = log2FC_BOglycolipid_noGal9, y = log2FC_BOglycolipid_Gal9, fill = mhc_category),
+    shape  = 21,          # filled circle with a separate border color
+    color  = "black",     # border color
+    stroke = 0.4,          # border thickness
+    size   = 2, alpha = 0.95
+  ) +
+ 
+  # Gene labels for the highlighted set only
+  ggrepel::geom_text_repel(
+    data = mhc_highlight_coords,
+    aes(x = log2FC_BOglycolipid_noGal9, y = log2FC_BOglycolipid_Gal9, label = gene_name),
+    size                = 3,
+    fontface            = "italic",
+    max.overlaps        = 20,
+    segment.size        = 0.3,
+    segment.color       = "grey40",
+    min.segment.length  = 0,
+    box.padding         = 0.4
+  ) +
+ 
+  scale_color_manual(
+    values = mhc_highlight_colors,
+    name   = "Top 5 significant genes\nby |log2FC| (Gal-9 added)"
+  ) +
+  coord_fixed(xlim = c(-ax_max, ax_max), ylim = c(-ax_max, ax_max)) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1), ncol = 1)) +
+  labs(
+    title    = "Top 5 MHC class I and MHC class II genes driving the Gal-9 effect",
+    subtitle = "Ranked by |log2FC| among genes significant (padj < 0.05) in BOglycolipid+Gal-9 vs BOglycolipid",
+    x        = "BO glycolipid effect without Gal-9 (log2FC)",
+    y        = "BO glycolipid effect with Gal-9 (log2FC)"
+  ) +
+  theme(
+    legend.box.margin = margin(0, 0, 0, 6)
+  ) +
+  ggh4x::force_panelsizes(rows = panel_size, cols = panel_size)
+ 
+scatter_plot_3
+ 
+ggsave(
+  filename = "BOglycolipid_response_scatter_MHC_top5_highlight.svg",
+  plot     = scatter_plot_3,
+  width    = plot_W,
+  height   = plot_H,
+  device   = svglite::svglite
+)
+```
+
+
